@@ -56,7 +56,7 @@ class MemberDetail(BaseModel):
 class RegistrationRequest(BaseModel):
     name: str
     phone: str
-    email: Optional[str]
+    email: Optional[str] = None
     gender: str
     age: int
     city: str
@@ -68,6 +68,25 @@ class RegistrationRequest(BaseModel):
 class AdminLogin(BaseModel):
     username: str
     password: str
+
+
+class VerifyTicketRequest(BaseModel):
+    ticket_id: str
+
+
+class ApproveEntryRequest(BaseModel):
+    ticket_id: str
+
+
+class CreateOrderRequest(BaseModel):
+    user_id: str
+
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_order_id: str
+    razorpay_signature: str
+    user_id: str
 
 
 # -------------------------
@@ -85,7 +104,6 @@ def root():
 
 @app.post("/admin/login")
 async def admin_login(login: AdminLogin):
-
     admin = db["admins"].find_one({"username": login.username})
 
     if not admin:
@@ -107,7 +125,6 @@ async def admin_login(login: AdminLogin):
 
 @app.post("/register")
 async def register_user(reg: RegistrationRequest):
-
     total_amount = (
         reg.adult_tickets * ADULT_TICKET_PRICE +
         reg.kid_tickets * KID_TICKET_PRICE
@@ -163,7 +180,6 @@ async def register_user(reg: RegistrationRequest):
 
 @app.get("/admin/stats")
 async def get_stats():
-
     total = db["users"].count_documents({})
     pending = db["users"].count_documents({"payment_status": "pending"})
     approved = db["users"].count_documents({"payment_status": "approved"})
@@ -180,56 +196,62 @@ async def get_stats():
 
 # -------------------------
 # GET REGISTRATIONS
+# FIX: Wrapped each record in try/except to avoid one bad document
+#      crashing the entire endpoint.
 # -------------------------
 
 @app.get("/admin/registrations")
 async def get_registrations():
-
     users = list(db["users"].find().sort("created_at", -1))
 
     results = []
 
     for u in users:
+        try:
+            uid = str(u["_id"])
+            entry = db["entries"].find_one({"user_id": uid})
 
-        uid = str(u["_id"])
+            created_at = u.get("created_at")
+            if created_at:
+                # If naive (old UTC records), make it UTC-aware, then convert to IST
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc).astimezone(IST)
+                created_at_str = created_at.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+            else:
+                created_at_str = None
 
-        entry = db["entries"].find_one({"user_id": uid})
-
-        created_at = u.get("created_at")
-        if created_at:
-            # If naive (old UTC records), make it UTC-aware, then convert to IST
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc).astimezone(IST)
-            created_at_str = created_at.strftime("%Y-%m-%dT%H:%M:%S+05:30")
-        else:
-            created_at_str = None
-
-        results.append({
-            "id": uid,
-            "name": u.get("name"),
-            "phone": u.get("phone"),
-            "email": u.get("email"),
-            "adult_tickets": u.get("adult_tickets"),
-            "kid_tickets": u.get("kid_tickets"),
-            "total_amount": u.get("total_amount"),
-            "payment_ref": u.get("payment_ref"),
-            "payment_status": u.get("payment_status"),
-            "created_at": created_at_str,
-            "entry_status": entry["entry_status"] if entry else None,
-            "qr_code": entry["qr_code"] if entry else None
-        })
+            results.append({
+                "id": uid,
+                "name": u.get("name"),
+                "phone": u.get("phone"),
+                "email": u.get("email"),
+                "gender": u.get("gender"),
+                "age": u.get("age"),
+                "city": u.get("city"),
+                "adult_tickets": u.get("adult_tickets"),
+                "kid_tickets": u.get("kid_tickets"),
+                "total_amount": u.get("total_amount"),
+                "payment_ref": u.get("payment_ref"),
+                "payment_status": u.get("payment_status"),
+                "created_at": created_at_str,
+                "entry_status": entry["entry_status"] if entry else None,
+                "qr_code": entry["qr_code"] if entry else None
+            })
+        except Exception as e:
+            print(f"[WARN] Skipping malformed user record: {e}")
+            continue
 
     return results
 
 
 # -------------------------
-# APPROVE USER
+# WHATSAPP HELPER
 # -------------------------
 
 def send_whatsapp_message(phone: str, user_name: str, ticket_id: str, qr_url: str):
     token = os.getenv("WHATSAPP_TOKEN", "")
     phone_id = os.getenv("WHATSAPP_PHONE_ID", "")
-    
+
     if not token or not phone_id:
         print("WhatsApp API credentials missing. Skipping message send.")
         return
@@ -240,7 +262,6 @@ def send_whatsapp_message(phone: str, user_name: str, ticket_id: str, qr_url: st
         "Content-Type": "application/json"
     }
 
-    # Format phone number for WhatsApp (e.g. adding 91 if it's a 10-digit Indian number)
     formatted_phone = phone.replace("+", "").replace("-", "").replace(" ", "")
     if len(formatted_phone) == 10:
         formatted_phone = f"91{formatted_phone}"
@@ -267,22 +288,31 @@ def send_whatsapp_message(phone: str, user_name: str, ticket_id: str, qr_url: st
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
         print(f"WhatsApp API Response: {response.text}")
     except Exception as e:
         print(f"Failed to send WhatsApp message: {str(e)}")
 
 
+# -------------------------
+# APPROVE USER
+# -------------------------
+
 @app.post("/admin/approve/{user_id}")
 async def approve_registration(user_id: str, request: Request):
+    # FIX: Validate ObjectId before querying to avoid 500 on bad IDs
+    try:
+        obj_id = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
 
-    user = db["users"].find_one({"_id": ObjectId(user_id)})
+    user = db["users"].find_one({"_id": obj_id})
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     db["users"].update_one(
-        {"_id": ObjectId(user_id)},
+        {"_id": obj_id},
         {"$set": {"payment_status": "approved"}}
     )
 
@@ -303,11 +333,9 @@ async def approve_registration(user_id: str, request: Request):
     qr_img = qrcode.make(qr_code)
     qr_img.save(f"static/qrcodes/{qr_code}.png")
 
-    # Determine public URL for the QR code
     base_url = str(request.base_url).rstrip('/')
     qr_url = f"{base_url}/static/qrcodes/{qr_code}.png"
 
-    # Send WhatsApp notification
     user_name = user.get("name", "Guest")
     phone = user.get("phone", "")
     send_whatsapp_message(phone, user_name, qr_code, qr_url)
@@ -315,9 +343,18 @@ async def approve_registration(user_id: str, request: Request):
     return {"status": "approved", "qr_code": qr_code}
 
 
+# -------------------------
+# RESEND WHATSAPP TICKET
+# -------------------------
+
 @app.post("/admin/send-whatsapp/{user_id}")
 async def send_whatsapp_ticket(user_id: str, request: Request):
-    user = db["users"].find_one({"_id": ObjectId(user_id)})
+    try:
+        obj_id = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
+
+    user = db["users"].find_one({"_id": obj_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -331,16 +368,15 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
     adults = user.get("adult_tickets", 0)
     kids = user.get("kid_tickets", 0)
     total_amount = user.get("total_amount", 0)
-    
-    # Needs to match user's strict format exactly:
+
     caption = (
         f"Hello {user_name},\n"
-        f"Your event ticket has been confirmed \U0001F389\n\n"
+        f"Your event ticket has been confirmed 🎉\n\n"
         f"Ticket Details:\n"
         f"Ticket ID: {qr_code}\n"
         f"Adults: {adults}\n"
         f"Kids: {kids}\n"
-        f"Total Amount: \u20B9{total_amount}\n\n"
+        f"Total Amount: ₹{total_amount}\n\n"
         f"Please show the QR code at the entry gate."
     )
 
@@ -349,7 +385,7 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
 
     token = os.getenv("WHATSAPP_TOKEN", "")
     phone_id = os.getenv("WHATSAPP_PHONE_ID", "")
-    
+
     if not token or not phone_id:
         print("WhatsApp API credentials missing.")
         return {"status": "skipped", "message": "Credentials missing"}
@@ -376,11 +412,10 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
         return {"status": "sent", "response": response.json()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 # -------------------------
@@ -389,23 +424,25 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
 
 @app.get("/entry/verify/{qr_code}")
 async def verify_entry(qr_code: str):
-
     entry = db["entries"].find_one({"qr_code": qr_code})
 
     if not entry:
         return {"status": "invalid"}
 
-    user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
+    try:
+        user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
+    except Exception:
+        return {"status": "invalid"}
 
     if entry["entry_status"] == "used":
         return {
             "status": "used",
-            "name": user["name"]
+            "name": user["name"] if user else "Unknown"
         }
 
     return {
         "status": "eligible",
-        "name": user["name"],
+        "name": user["name"] if user else "Unknown",
         "entry_id": str(entry["_id"])
     }
 
@@ -416,9 +453,13 @@ async def verify_entry(qr_code: str):
 
 @app.post("/entry/confirm/{entry_id}")
 async def confirm_entry(entry_id: str):
+    try:
+        obj_id = ObjectId(entry_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid entry ID format")
 
     db["entries"].update_one(
-        {"_id": ObjectId(entry_id)},
+        {"_id": obj_id},
         {"$set": {
             "entry_status": "used",
             "entry_time": datetime.now(IST)
@@ -432,22 +473,20 @@ async def confirm_entry(entry_id: str):
 # VERIFY TICKET (QR SCANNER)
 # -------------------------
 
-class VerifyTicketRequest(BaseModel):
-    ticket_id: str
-
-class ApproveEntryRequest(BaseModel):
-    ticket_id: str
-
 @app.post("/verify-ticket")
 async def verify_ticket(req: VerifyTicketRequest):
     ticket = db["tickets"].find_one({"ticket_id": req.ticket_id})
 
     if not ticket:
-        # Fallback to older `entries` format for backwards compatibility if needed
+        # Fallback to older `entries` format for backwards compatibility
         entry = db["entries"].find_one({"qr_code": req.ticket_id})
         if entry:
-            user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
-            user_name = user["name"] if user else "Unknown"
+            try:
+                user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
+                user_name = user["name"] if user else "Unknown"
+            except Exception:
+                user_name = "Unknown"
+
             if entry.get("entry_status") == "used":
                 return {"status": "already_used", "name": user_name}
             return {"status": "valid", "name": user_name}
@@ -464,15 +503,15 @@ async def verify_ticket(req: VerifyTicketRequest):
         "name": ticket.get("name", "Unknown")
     }
 
+
 @app.post("/approve-entry")
 async def approve_entry(req: ApproveEntryRequest):
     result = db["tickets"].update_one(
         {"ticket_id": req.ticket_id},
         {"$set": {"is_used": True}}
     )
-    
+
     if result.matched_count == 0:
-        # Check backwards compatibility DB
         entry = db["entries"].find_one({"qr_code": req.ticket_id})
         if entry:
             db["entries"].update_one(
@@ -484,7 +523,7 @@ async def approve_entry(req: ApproveEntryRequest):
             )
             return {"status": "success"}
         return {"status": "invalid"}
-        
+
     return {"status": "success"}
 
 
@@ -492,14 +531,16 @@ async def approve_entry(req: ApproveEntryRequest):
 # RAZORPAY ORDER
 # -------------------------
 
-class CreateOrderRequest(BaseModel):
-    user_id: str
-
-
 @app.post("/payment/create-order")
 async def create_order(req: CreateOrderRequest):
+    try:
+        obj_id = ObjectId(req.user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
 
-    user = db["users"].find_one({"_id": ObjectId(req.user_id)})
+    user = db["users"].find_one({"_id": obj_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
     amount = int(user["total_amount"]) * 100
 
@@ -510,7 +551,7 @@ async def create_order(req: CreateOrderRequest):
     })
 
     db["users"].update_one(
-        {"_id": ObjectId(req.user_id)},
+        {"_id": obj_id},
         {"$set": {"razorpay_order_id": order["id"]}}
     )
 
@@ -523,31 +564,34 @@ async def create_order(req: CreateOrderRequest):
 
 # -------------------------
 # VERIFY PAYMENT
+# FIX: Changed hmac.new → hmac.new (correct: hmac.new is valid in Python 3,
+#      but the real fix is ensuring RAZORPAY_KEY_SECRET is not None before encode())
 # -------------------------
-
-class VerifyPaymentRequest(BaseModel):
-    razorpay_payment_id: str
-    razorpay_order_id: str
-    razorpay_signature: str
-    user_id: str
-
 
 @app.post("/payment/verify")
 async def verify_payment(req: VerifyPaymentRequest):
+    if not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay secret not configured")
 
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
 
+    # FIX: Use hmac.new correctly (was already correct syntax, but added None guard above)
     expected = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        body.encode(),
+        RAZORPAY_KEY_SECRET.encode("utf-8"),
+        body.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
 
     if not hmac.compare_digest(expected, req.razorpay_signature):
-        raise HTTPException(status_code=400, detail="Invalid payment")
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+    try:
+        obj_id = ObjectId(req.user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
 
     db["users"].update_one(
-        {"_id": ObjectId(req.user_id)},
+        {"_id": obj_id},
         {"$set": {
             "payment_status": "approved",
             "razorpay_payment_id": req.razorpay_payment_id
@@ -557,24 +601,33 @@ async def verify_payment(req: VerifyPaymentRequest):
     return {"status": "payment verified"}
 
 
+# -------------------------
+# DASHBOARD
+# -------------------------
+
 @app.get("/dashboard")
 async def get_dashboard():
     total = db["users"].count_documents({})
     pending = db["users"].count_documents({"payment_status": "pending"})
     approved = db["users"].count_documents({"payment_status": "approved"})
     entered = db["entries"].count_documents({"entry_status": "used"})
-    # Latest 20 users for attendees list
+
     latest_users = list(db["users"].find().sort("created_at", -1).limit(20))
     attendees = []
     for u in latest_users:
-        name = u.get("name", "")
-        parts = name.strip().split()
-        initials = "".join([p[0].upper() for p in parts if p]) or "?"
-        attendees.append({
-            "name": name,
-            "initials": initials,
-            "status": u.get("payment_status", "pending").upper()
-        })
+        try:
+            name = u.get("name", "")
+            parts = name.strip().split()
+            initials = "".join([p[0].upper() for p in parts if p]) or "?"
+            attendees.append({
+                "name": name,
+                "initials": initials,
+                "status": u.get("payment_status", "pending").upper()
+            })
+        except Exception as e:
+            print(f"[WARN] Skipping bad attendee record: {e}")
+            continue
+
     return {
         "totalRegistrations": total,
         "pendingApprovals": pending,
