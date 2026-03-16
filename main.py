@@ -23,9 +23,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Holi Event API (MongoDB)")
 
-os.makedirs("static/qrcodes", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+# ✅ CORS must be added BEFORE mounting static files
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+os.makedirs("static/qrcodes", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 ADULT_TICKET_PRICE = 2499
 KID_TICKET_PRICE = 499
