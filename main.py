@@ -155,7 +155,8 @@ async def register_user(reg: RegistrationRequest):
 
     result = db["users"].insert_one(user)
 
-    ticket_id = f"HOLI-{uuid.uuid4().hex[:8].upper()}"
+    # ✅ FIXED: Ticket ID now uses HOLI-2026-XXXXXXXX format
+    ticket_id = f"HOLI-2026-{uuid.uuid4().hex[:8].upper()}"
     ticket = {
         "ticket_id": ticket_id,
         "name": reg.name,
@@ -322,6 +323,7 @@ async def approve_registration(user_id: str, request: Request):
     if entry:
         qr_code = entry["qr_code"]
     else:
+        # ✅ FIXED: QR code also uses HOLI-2026-XXXXXXXX format
         qr_code = f"HOLI-2026-{uuid.uuid4().hex[:8].upper()}"
         db["entries"].insert_one({
             "user_id": user_id,
@@ -425,15 +427,27 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
 
 @app.get("/entry/verify/{qr_code}")
 async def verify_entry(qr_code: str):
-    entry = db["entries"].find_one({"qr_code": qr_code})
+    # 1. Check in 'tickets' collection (new format)
+    ticket = db["tickets"].find_one({"ticket_id": qr_code})
+    if ticket:
+        if ticket.get("is_used", False):
+            return {"status": "used", "name": ticket.get("name", "Unknown")}
+        return {
+            "status": "eligible",
+            "name": ticket.get("name", "Unknown"),
+            "entry_id": str(ticket["_id"]),
+            "is_ticket": True
+        }
 
+    # 2. Fallback to 'entries' collection (legacy/alternative format)
+    entry = db["entries"].find_one({"qr_code": qr_code})
     if not entry:
         return {"status": "invalid"}
 
     try:
         user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
     except Exception:
-        return {"status": "invalid"}
+        user = None
 
     if entry["entry_status"] == "used":
         return {
