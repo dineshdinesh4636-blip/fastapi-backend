@@ -16,6 +16,7 @@ client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
 # Access the database
 db = client["holi_event"]
 
-# Test connection
-client.admin.command("ping")
-print("🔥 MongoDB Connected Successfully")
+# ✅ FIX: Connection is tested lazily on first real DB call.
+# Removed client.admin.command("ping") from module-level —
+# it ran synchronously at import time and crashed the entire
+# FastAPI server before it could start if MongoDB was unreachable.
