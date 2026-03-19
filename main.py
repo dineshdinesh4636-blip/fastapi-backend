@@ -23,7 +23,6 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Holi Event API (MongoDB)")
 
-# ✅ CORS must be added BEFORE mounting static files
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,6 +33,22 @@ app.add_middleware(
 
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# -------------------------
+# STARTUP: BACKFILL MIGRATION
+# -------------------------
+
+@app.on_event("startup")
+async def backfill_is_used():
+    result = db["tickets"].update_many(
+        {"is_used": {"$exists": False}},
+        {"$set": {"is_used": False, "used_at": None}}
+    )
+    if result.modified_count:
+        print(f"[MIGRATION] Backfilled is_used=False on {result.modified_count} tickets")
+    else:
+        print("[MIGRATION] All tickets already have is_used field — no changes needed")
+
 
 ADULT_TICKET_PRICE = 2499
 KID_TICKET_PRICE = 499
@@ -77,6 +92,11 @@ class VerifyTicketRequest(BaseModel):
 
 class ApproveEntryRequest(BaseModel):
     ticket_id: str
+
+
+class ConfirmMemberRequest(BaseModel):
+    ticket_id: str
+    member_index: int
 
 
 class CreateOrderRequest(BaseModel):
@@ -155,15 +175,34 @@ async def register_user(reg: RegistrationRequest):
 
     result = db["users"].insert_one(user)
 
-    # ✅ FIXED: Ticket ID now uses HOLI-2026-XXXXXXXX format
     ticket_id = f"HOLI-2026-{uuid.uuid4().hex[:8].upper()}"
+
+    ticket_members = []
+    if reg.members and len(reg.members) > 0:
+        for m in reg.members:
+            ticket_members.append({
+                "name": m.name,
+                "phone": m.phone,
+                "type": m.type,
+                "confirmed": False
+            })
+    else:
+        ticket_members.append({
+            "name": reg.name,
+            "phone": reg.phone,
+            "type": "Adult" if reg.adult_tickets > 0 else "Kid",
+            "confirmed": False
+        })
+
     ticket = {
         "ticket_id": ticket_id,
         "name": reg.name,
         "phone": reg.phone,
         "ticket_type": f"{reg.adult_tickets}A + {reg.kid_tickets}K",
         "qr_code": ticket_id,
-        "is_used": False
+        "is_used": False,
+        "used_at": None,
+        "members": ticket_members
     }
     db["tickets"].insert_one(ticket)
 
@@ -198,8 +237,6 @@ async def get_stats():
 
 # -------------------------
 # GET REGISTRATIONS
-# FIX: Wrapped each record in try/except to avoid one bad document
-#      crashing the entire endpoint.
 # -------------------------
 
 @app.get("/admin/registrations")
@@ -215,7 +252,6 @@ async def get_registrations():
 
             created_at = u.get("created_at")
             if created_at:
-                # If naive (old UTC records), make it UTC-aware, then convert to IST
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=timezone.utc).astimezone(IST)
                 created_at_str = created_at.strftime("%Y-%m-%dT%H:%M:%S+05:30")
@@ -302,7 +338,6 @@ def send_whatsapp_message(phone: str, user_name: str, ticket_id: str, qr_url: st
 
 @app.post("/admin/approve/{user_id}")
 async def approve_registration(user_id: str, request: Request):
-    # FIX: Validate ObjectId before querying to avoid 500 on bad IDs
     try:
         obj_id = ObjectId(user_id)
     except Exception:
@@ -318,12 +353,10 @@ async def approve_registration(user_id: str, request: Request):
         {"$set": {"payment_status": "approved"}}
     )
 
-    # Check if entry already exists to prevent duplication
     entry = db["entries"].find_one({"user_id": user_id})
     if entry:
         qr_code = entry["qr_code"]
     else:
-        # ✅ FIXED: QR code also uses HOLI-2026-XXXXXXXX format
         qr_code = f"HOLI-2026-{uuid.uuid4().hex[:8].upper()}"
         db["entries"].insert_one({
             "user_id": user_id,
@@ -332,7 +365,6 @@ async def approve_registration(user_id: str, request: Request):
             "entry_time": None
         })
 
-    # Generate and save QR Code image locally
     qr_img = qrcode.make(qr_code)
     qr_img.save(f"static/qrcodes/{qr_code}.png")
 
@@ -427,19 +459,23 @@ async def send_whatsapp_ticket(user_id: str, request: Request):
 
 @app.get("/entry/verify/{qr_code}")
 async def verify_entry(qr_code: str):
-    # 1. Check in 'tickets' collection (new format)
     ticket = db["tickets"].find_one({"ticket_id": qr_code})
     if ticket:
+        members = ticket.get("members", [])
         if ticket.get("is_used", False):
-            return {"status": "used", "name": ticket.get("name", "Unknown")}
+            return {
+                "status": "used",
+                "name": ticket.get("name", "Unknown"),
+                "members": members
+            }
         return {
             "status": "eligible",
             "name": ticket.get("name", "Unknown"),
             "entry_id": str(ticket["_id"]),
-            "is_ticket": True
+            "is_ticket": True,
+            "members": members
         }
 
-    # 2. Fallback to 'entries' collection (legacy/alternative format)
     entry = db["entries"].find_one({"qr_code": qr_code})
     if not entry:
         return {"status": "invalid"}
@@ -485,61 +521,123 @@ async def confirm_entry(entry_id: str):
 
 
 # -------------------------
-# VERIFY TICKET (QR SCANNER)
+# VERIFY TICKET (QR SCANNER — atomic)
 # -------------------------
 
 @app.post("/verify-ticket")
 async def verify_ticket(req: VerifyTicketRequest):
-    ticket = db["tickets"].find_one({"ticket_id": req.ticket_id})
+    ticket = db["tickets"].find_one_and_update(
+        {
+            "ticket_id": req.ticket_id,
+            "$or": [
+                {"is_used": False},
+                {"is_used": {"$exists": False}},
+                {"is_used": None}
+            ]
+        },
+        {"$set": {"is_used": True, "used_at": datetime.now(IST)}},
+        return_document=False
+    )
 
-    if not ticket:
-        # Fallback to older `entries` format for backwards compatibility
-        entry = db["entries"].find_one({"qr_code": req.ticket_id})
-        if entry:
-            try:
-                user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
-                user_name = user["name"] if user else "Unknown"
-            except Exception:
-                user_name = "Unknown"
+    if ticket:
+        print(f"[SCAN] VALID: ticket_id={req.ticket_id} name={ticket.get('name')}")
+        return {"status": "valid", "name": ticket.get("name", "Unknown")}
 
-            if entry.get("entry_status") == "used":
-                return {"status": "already_used", "name": user_name}
-            return {"status": "valid", "name": user_name}
-        return {"status": "invalid"}
+    used_ticket = db["tickets"].find_one({"ticket_id": req.ticket_id})
+    if used_ticket:
+        print(f"[SCAN] ALREADY USED: ticket_id={req.ticket_id}")
+        return {"status": "already_used", "name": used_ticket.get("name", "Unknown")}
 
-    if ticket.get("is_used", False):
-        return {
-            "status": "already_used",
-            "name": ticket.get("name", "Unknown")
-        }
+    entry = db["entries"].find_one_and_update(
+        {"qr_code": req.ticket_id, "entry_status": {"$ne": "used"}},
+        {"$set": {"entry_status": "used", "entry_time": datetime.now(IST)}},
+        return_document=False
+    )
 
-    return {
-        "status": "valid",
-        "name": ticket.get("name", "Unknown")
-    }
+    if entry:
+        try:
+            user = db["users"].find_one({"_id": ObjectId(entry["user_id"])})
+            user_name = user["name"] if user else "Unknown"
+        except Exception:
+            user_name = "Unknown"
+        print(f"[SCAN] VALID (legacy): qr={req.ticket_id} name={user_name}")
+        return {"status": "valid", "name": user_name}
 
+    used_entry = db["entries"].find_one({"qr_code": req.ticket_id})
+    if used_entry:
+        try:
+            user = db["users"].find_one({"_id": ObjectId(used_entry["user_id"])})
+            user_name = user["name"] if user else "Unknown"
+        except Exception:
+            user_name = "Unknown"
+        print(f"[SCAN] ALREADY USED (legacy): qr={req.ticket_id}")
+        return {"status": "already_used", "name": user_name}
+
+    print(f"[SCAN] INVALID: ticket_id={req.ticket_id}")
+    return {"status": "invalid"}
+
+
+# -------------------------
+# APPROVE ENTRY
+# -------------------------
 
 @app.post("/approve-entry")
 async def approve_entry(req: ApproveEntryRequest):
-    result = db["tickets"].update_one(
+    ticket = db["tickets"].find_one({"ticket_id": req.ticket_id})
+    if ticket:
+        members = ticket.get("members", [])
+        for m in members:
+            m["confirmed"] = True
+        db["tickets"].update_one(
+            {"ticket_id": req.ticket_id},
+            {"$set": {"is_used": True, "used_at": datetime.now(IST), "members": members}}
+        )
+        return {"status": "success"}
+
+    entry = db["entries"].find_one({"qr_code": req.ticket_id})
+    if entry:
+        db["entries"].update_one(
+            {"_id": entry["_id"]},
+            {"$set": {"entry_status": "used", "entry_time": datetime.now(IST)}}
+        )
+        return {"status": "success"}
+
+    return {"status": "invalid"}
+
+
+# -------------------------
+# CONFIRM INDIVIDUAL MEMBER
+# -------------------------
+
+@app.post("/entry/confirm-member")
+async def confirm_member(req: ConfirmMemberRequest):
+    ticket = db["tickets"].find_one({"ticket_id": req.ticket_id})
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    members = ticket.get("members", [])
+    if req.member_index < 0 or req.member_index >= len(members):
+        raise HTTPException(status_code=400, detail="Invalid member index")
+
+    members[req.member_index]["confirmed"] = True
+
+    all_confirmed = all(m.get("confirmed", False) for m in members)
+
+    update_fields: dict = {"members": members}
+    if all_confirmed:
+        update_fields["is_used"] = True
+        update_fields["used_at"] = datetime.now(IST)
+
+    db["tickets"].update_one(
         {"ticket_id": req.ticket_id},
-        {"$set": {"is_used": True}}
+        {"$set": update_fields}
     )
 
-    if result.matched_count == 0:
-        entry = db["entries"].find_one({"qr_code": req.ticket_id})
-        if entry:
-            db["entries"].update_one(
-                {"_id": entry["_id"]},
-                {"$set": {
-                    "entry_status": "used",
-                    "entry_time": datetime.now(IST)
-                }}
-            )
-            return {"status": "success"}
-        return {"status": "invalid"}
-
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "all_confirmed": all_confirmed,
+        "members": members
+    }
 
 
 # -------------------------
@@ -579,8 +677,7 @@ async def create_order(req: CreateOrderRequest):
 
 # -------------------------
 # VERIFY PAYMENT
-# FIX: Changed hmac.new → hmac.new (correct: hmac.new is valid in Python 3,
-#      but the real fix is ensuring RAZORPAY_KEY_SECRET is not None before encode())
+# FIX: `hmac.new()` does not exist — correct function is `hmac.new(key, msg, digestmod)`
 # -------------------------
 
 @app.post("/payment/verify")
@@ -590,7 +687,7 @@ async def verify_payment(req: VerifyPaymentRequest):
 
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
 
-    # FIX: Use hmac.new correctly (was already correct syntax, but added None guard above)
+    # ✅ FIXED: correct hmac usage
     expected = hmac.new(
         RAZORPAY_KEY_SECRET.encode("utf-8"),
         body.encode("utf-8"),
