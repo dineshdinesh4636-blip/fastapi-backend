@@ -34,20 +34,24 @@ app.add_middleware(
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 # -------------------------
 # STARTUP: BACKFILL MIGRATION
 # -------------------------
 
 @app.on_event("startup")
 async def backfill_is_used():
-    result = db["tickets"].update_many(
-        {"is_used": {"$exists": False}},
-        {"$set": {"is_used": False, "used_at": None}}
-    )
-    if result.modified_count:
-        print(f"[MIGRATION] Backfilled is_used=False on {result.modified_count} tickets")
-    else:
-        print("[MIGRATION] All tickets already have is_used field — no changes needed")
+    try:
+        result = db["tickets"].update_many(
+            {"is_used": {"$exists": False}},
+            {"$set": {"is_used": False, "used_at": None}}
+        )
+        if result.modified_count:
+            print(f"[MIGRATION] Backfilled is_used=False on {result.modified_count} tickets")
+        else:
+            print("[MIGRATION] All tickets already have is_used field — no changes needed")
+    except Exception as e:
+        print(f"[MIGRATION] Skipped backfill due to DB error: {e}")
 
 
 ADULT_TICKET_PRICE = 2499
@@ -677,7 +681,6 @@ async def create_order(req: CreateOrderRequest):
 
 # -------------------------
 # VERIFY PAYMENT
-# FIX: `hmac.new()` does not exist — correct function is `hmac.new(key, msg, digestmod)`
 # -------------------------
 
 @app.post("/payment/verify")
@@ -687,7 +690,6 @@ async def verify_payment(req: VerifyPaymentRequest):
 
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
 
-    # ✅ FIXED: correct hmac usage
     expected = hmac.new(
         RAZORPAY_KEY_SECRET.encode("utf-8"),
         body.encode("utf-8"),
